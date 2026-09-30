@@ -1,0 +1,97 @@
+name: Data Pipeline CI/CD to AWS S3 & Snowflake
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Best practice: Minimize permissions at the workflow level
+permissions:
+  contents: read
+
+# Cancel redundant runs on rapid updates
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------
+  # Job 1: Lint, Validate Code, & Test Snowflake Connectivity
+  # -------------------------------------------------------------
+  validate-and-test:
+    name: Code Quality & Snowflake Integration Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install ruff pytest snowflake-connector-python
+
+      - name: Run code linting & formatting checks
+        run: ruff check .
+
+      - name: Run unit & integration tests
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ vars.SNOWFLAKE_DATABASE }}
+          SNOWFLAKE_SCHEMA: ${{ vars.SNOWFLAKE_SCHEMA }}
+        run: pytest tests/
+
+  # -------------------------------------------------------------
+  # Job 2: Deploy to S3 (Runs only on push to main)
+  # -------------------------------------------------------------
+  deploy-to-s3:
+    name: Package and Deploy to AWS S3
+    needs: validate-and-test
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Required for keyless OIDC authentication with AWS
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          # Package your deployment artifacts (e.g., pipeline scripts, configs, wheel packages)
+          tar --exclude='./dist' --exclude='./.git' --exclude='./tests' -czf dist/pipeline-${{ github.sha }}.tar.gz .
+          cp -r src/ dist/latest/ 2>/dev/null || true
+
+      - name: Sync artifacts to S3
+        run: |
+          # Sync immutable commit-tagged build artifact
+          aws s3 cp dist/pipeline-${{ github.sha }}.tar.gz s3://${{ vars.S3_BUCKET_NAME }}/builds/pipeline-${{ github.sha }}.tar.gz
+          
+          # Sync latest execution code/scripts
+          if [ -d dist/latest ]; then
+            aws s3 sync dist/latest/ s3://${{ vars.S3_BUCKET_NAME }}/code/latest/ --delete
+          fi
+
+      - name: Verify S3 upload
+        run: |
+          aws s3 ls s3://${{ vars.S3_BUCKET_NAME }}/builds/pipeline-${{ github.sha }}.tar.gz
