@@ -5,7 +5,7 @@ import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
 
 def load_csv_to_snowflake():
-    csv_file_path = "data/my_data.csv" # Or take from env var/arg
+    csv_file_path = "data/gender_submission.csv" # Or take from env var/arg
     table_name = "MY_NEW_TABLE"
     
     # 1. Read CSV
